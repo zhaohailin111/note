@@ -1,4 +1,4 @@
-coocood.freecache
+**coocood.freecache**
 
 **0gc的缓存，目前很多本地缓存都会有由于gc导致的程序卡顿。freecache缓存是基于ringbuf的无gc的本读缓存。用法很简单，先new再set再get**
 
@@ -426,6 +426,7 @@ func (seg *segment) set(key, value []byte, hashVal uint64, expireSeconds int) (e
 		// otherwise there would be index out of bound error.
 		slot = seg.getSlot(slotId)
 		// 优雅
+		// 这个地方的idx就是二分去定位的，所以也是顺序插入的
 		idx, match = seg.lookup(slot, hash16, key) // 因为走到这里，key一定不会命中了，那那么这个idx就是这个slot的新entry
 		// assert(match == false)
 	}
