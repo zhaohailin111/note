@@ -3,6 +3,13 @@
 
 **拉链法**
 
+**对于hash以后的结果，如果后缀相同的，放在一个桶里面，也就是拉出一个链表，桶的大小是8。如果拉出的链表大于8会生成一个溢出桶。溢出桶会决定什么时候扩容**
+
+**扩容触发依赖总数量和溢出桶数量**
+
+- 总数量过多会触发扩容
+- 溢出桶数量过多会触发扩容（防止出现总数量不多，但是hash算法不良导致都跑到一个桶里面）
+
 ```go
 // A header for a Go map.
 type hmap struct {
@@ -17,6 +24,47 @@ type hmap struct {
 	nevacuate  uintptr        
 
 	extra *mapextra // optional fields
+}
+```
+```go
+
+// 2^b
+// bucketShift returns 1<<b, optimized for code generation.
+func bucketShift(b uint8) uintptr {
+	// Masking the shift amount allows overflow checks to be elided.
+	// todo？
+	return uintptr(1) << (b & (sys.PtrSize*8 - 1))
+}
+
+// 2^b-1
+// bucketMask returns 1<<b - 1, optimized for code generation.
+func bucketMask(b uint8) uintptr {
+	return bucketShift(b) - 1
+}
+
+// 取hash值的高8位
+func tophash(hash uintptr) uint8 {
+	// 这个top是计算出来的hash右移56位
+	// 如果是int64位，则最高的8个01串就是最终结果
+	top := uint8(hash >> (sys.PtrSize*8 - 8))
+	
+	// wc，为了不额外使用变量存储状态
+	// tophash占用了5个数去进行标记这个位置元素的状态
+	// 那进行比较的tophash就要大于5，如果小于5，则表示的hash状态
+	if top < minTopHash {
+		top += minTopHash
+	}
+	return top
+}
+
+// 是否溢出，需要扩容
+func overLoadFactor(count int, B uint8) bool {
+	return 
+		// 总数还不到一个桶，肯定不需要扩容
+		count > bucketCnt && 
+		
+		// 总数/桶数量 > 13/2 溢出因子就是6.5
+		uintptr(count) > loadFactorNum*(bucketShift(B)/loadFactorDen)
 }
 ```
 
@@ -54,6 +102,58 @@ func makemap(t *maptype, hint int, h *hmap) *hmap {
 	}
 
 	return h
+}
+```
+
+```go
+// 根据桶大小获取桶和溢出桶
+func makeBucketArray(t *maptype, b uint8, dirtyalloc unsafe.Pointer) (buckets unsafe.Pointer, nextOverflow *bmap) {
+	// 桶的数量
+	base := bucketShift(b)
+	nbuckets := base
+	
+	// 需要提前预估桶数量
+	// 如果普通桶数量小于2^4。那就不太可能有溢出桶
+	if b >= 4 {
+	
+		// 预分配的桶数量是2^(b-4)
+		nbuckets += bucketShift(b - 4)
+		sz := t.bucket.size * nbuckets
+		up := roundupsize(sz)
+		if up != sz {
+			nbuckets = up / t.bucket.size
+		}
+	}
+
+	// dirtyalloc是否有脏的空间
+	// 如果没有的话说明是扩容，或者创建
+	if dirtyalloc == nil {
+		buckets = newarray(t.bucket, int(nbuckets))
+		
+	// clear这个map
+	} else {
+		// 因为dirtyalloc不是空的所以直接复用空间
+		buckets = dirtyalloc
+		size := t.bucket.size * nbuckets
+		// todo，后面这两个函数
+		if t.bucket.ptrdata != 0 {
+			memclrHasPointers(buckets, size)
+		} else {
+			memclrNoHeapPointers(buckets, size)
+		}
+	}
+
+	// 说明有溢出桶
+	if base != nbuckets {
+		// 第一个溢出桶就是直接放在正常桶的后面
+		nextOverflow = (*bmap)(add(buckets, base*uintptr(t.bucketsize)))
+		
+		// 最后一个溢出桶后面又跟着正常的桶
+		// 为了给最后一个桶一个安全指针
+		last := (*bmap)(add(buckets, (nbuckets-1)*uintptr(t.bucketsize)))
+		last.setoverflow(t, (*bmap)(buckets))
+	}
+	return buckets, nextOverflow
 }
 ```
 
@@ -311,4 +411,143 @@ done:
 }
 
 // map的代码也是充斥的goto还有循环，但是流程上还是很清晰的
+```
+
+```go
+// map删除元素
+func mapdelete(t *maptype, h *hmap, key unsafe.Pointer) {
+	if h == nil || h.count == 0 {
+		if t.hashMightPanic() {
+			t.hasher(key, 0) // see issue 23734
+		}
+		return
+	}
+	if h.flags&hashWriting != 0 {
+		throw("concurrent map writes")
+	}
+
+	hash := t.hasher(key, uintptr(h.hash0))
+
+	// 设置map状态
+	h.flags ^= hashWriting
+
+	bucket := hash & bucketMask(h.B)
+	if h.growing() {
+		growWork(t, h, bucket)
+	}
+	b := (*bmap)(add(h.buckets, bucket*uintptr(t.bucketsize)))
+	
+	// 把当前的桶保存下，在删除的时候可能b就变成溢出桶了
+	bOrig := b
+	top := tophash(hash)
+search:
+	for ; b != nil; b = b.overflow(t) {
+		for i := uintptr(0); i < bucketCnt; i++ {
+		
+			// tophash不同直接继续
+			if b.tophash[i] != top {
+			
+				// 这里判断当前桶后面没了，并且溢出桶没了
+				// 直接返回，map里面没有这个key
+				if b.tophash[i] == emptyRest {
+					break search
+				}
+				continue
+			}
+			
+			// 拿到k并比较
+			k := add(unsafe.Pointer(b), dataOffset+i*uintptr(t.keysize))
+			k2 := k
+			if t.indirectkey() {
+				k2 = *((*unsafe.Pointer)(k2))
+			}
+			if !t.key.equal(key, k2) {
+				continue
+			}
+			
+			// todo
+			// 只有存的指针的时候进行清除
+			if t.indirectkey() {
+				*(*unsafe.Pointer)(k) = nil
+				
+			// 从k地址清除若干个子节
+			} else if t.key.ptrdata != 0 {
+				memclrHasPointers(k, t.key.size)
+			}
+			
+			// 逻辑和k一样
+			e := add(unsafe.Pointer(b), dataOffset+bucketCnt*uintptr(t.keysize)+i*uintptr(t.elemsize))
+			if t.indirectelem() {
+				*(*unsafe.Pointer)(e) = nil
+			} else if t.elem.ptrdata != 0 {
+				memclrHasPointers(e, t.elem.size)
+			} else {
+				// 非堆上内存
+				memclrNoHeapPointers(e, t.elem.size)
+			}
+			
+			// 当前元素置为空
+			b.tophash[i] = emptyOne
+			
+			// 判断下一个元素是不是emptyRest状态
+			// 如果不是，直接删除完成，结束了
+			// 当前元素是当前桶最后一个，判断溢出桶的第一个
+			if i == bucketCnt-1 {
+				if b.overflow(t) != nil && b.overflow(t).tophash[0] != emptyRest {
+					goto notLast
+				}
+			} else {
+			
+				// 判断当前桶的下一个
+				if b.tophash[i+1] != emptyRest {
+					goto notLast
+				}
+			}
+			
+			// 依次向前将寻找状态是emptyOne
+			// 将状态改为emptyRest
+			for {
+				//	当前的元素肯定是最后一个了
+				b.tophash[i] = emptyRest
+				if i == 0 {
+					// 如果不在溢出桶，且是最后一个
+					// 说明是当前这个hash后缀的第一个
+					// 第一个都变成emptyRest，不需要再向前了
+					if b == bOrig {
+						break // beginning of initial bucket, we're done.
+					}
+					// Find previous bucket, continue at its last entry.
+					
+					// 拿到前面的桶
+					c := b
+					for b = bOrig; b.overflow(t) != c; b = b.overflow(t) {
+					}
+					
+					// 拿到前面的桶以后，从桶最后一个元素向前遍历
+					i = bucketCnt - 1
+				} else {
+					i--
+				}
+				
+				// 如果是emptyOne，
+				// 因为它后面的元素已经是emptyRest，那它也可以变成emptyRest
+				// 否则的话就break，因为这个元素不是emptyOne
+				if b.tophash[i] != emptyOne {
+					break
+				}
+			}
+		notLast:
+			h.count--
+			break search
+		}
+	}
+
+	// ？
+	if h.flags&hashWriting == 0 {
+		throw("concurrent map writes")
+	}
+	
+	// 修改状态，删除结束
+	h.flags &^= hashWriting
+}
 ```
