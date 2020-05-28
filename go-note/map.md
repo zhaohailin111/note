@@ -620,6 +620,8 @@ func evacuate(t *maptype, h *hmap, oldbucket uintptr) {
 				// 拿到这个元素的状态
 				// 如果这个元素是空的，则设置为扩容后为空
 				// 这个状态for range map会用到
+				// 这个状态是否有必要呢？
+				// 迭代的时候也不会访问他
 				top := b.tophash[i]
 				if isEmpty(top) {
 					b.tophash[i] = evacuatedEmpty
@@ -650,6 +652,11 @@ func evacuate(t *maptype, h *hmap, oldbucket uintptr) {
 					// 这时候根据tophash最低位判断用哪个xy，并且还要重算top，因为hash变了
 					// 去了哪里其实是完全随机的了
 					if h.flags&iterator != 0 && !t.reflexivekey() && !t.key.equal(k2, k2) {
+						// 根据旧的top决定是否在y桶
+						// 新的hash再计算top
+						// 这个top本质上也没什么意义了。
+						// 这种k不能查找更新删除
+						// 唯一要考虑的就是迭代的时候要迭代它
 						useY = top & 1
 						top = tophash(hash)
 					} else {
@@ -1031,6 +1038,7 @@ next:
 		}
 		
 		// 当前的k没有被拿走
+		// 或者当前的k是不可重现的
 		if (b.tophash[offi] != evacuatedX && b.tophash[offi] != evacuatedY) ||
 			
 			// t.key.equal(k, k) 只有在k=math.NaN()成立
@@ -1041,6 +1049,13 @@ next:
 			// 这种情况计算出来的hash是不一样的
 			// 这个地方就是判断这个值如果是math.NaN()类型，就直接可以取出
 			// 因为math.NaN()不能通过mapaccessK找到
+			
+			// 这里要表达的意思就是即使当前的key已经改成了evacuatedX或者evacuatedY还要从这里拿
+			// 因为这个key是不可以重现的，也就是hash以后的结果就不一样了。不能通过mapaccessK获取
+			
+			// 其他的key为什么从这里拿，即使状态evacuatedX或者evacuatedY，这个元素也是可访问的
+			// 因为这个key可能已经变更或删除了，修改后不会更新扩容之前的。
+			// 而这个不可重新的key刚好又不用担心被删除或者被更新了。
 			!(t.reflexivekey() || t.key.equal(k, k)) {
 			it.key = k
 			if t.indirectelem() {
@@ -1051,6 +1066,8 @@ next:
 			// 当前的k被挪走了，要再查一次，因为现在时不知道怎么挪动的
 			// 有可能发生的事情时挪动和迭代同时
 			// 这个才挪走一半，迭代就开始了
+			// 可以看到迭代其实是不能和写入同时进行的，迭代也被当作读
+			// map要么就单线程操作，要么就只能一次初始化后续只能读
 			rk, re := mapaccessK(t, h, k)
 			if rk == nil {
 				continue // key has been deleted
