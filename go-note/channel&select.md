@@ -546,18 +546,22 @@ func reflect_rselect(cases []runtimeSelect) (int, bool) {
 
 // select的代码一大坨
 func selectgo(cas0 *scase, order0 *uint16, ncases int) (int, bool) {
-
+	
+	// 将传入的case列表强转
 	cas1 := (*[1 << 16]scase)(unsafe.Pointer(cas0))
 	order1 := (*[1 << 17]uint16)(unsafe.Pointer(order0))
 
+	// select的case列表
 	scases := cas1[:ncases:ncases]
+	// select的顺序
 	pollorder := order1[:ncases:ncases]
+	// 给每个chan加锁时的顺序
 	lockorder := order1[ncases:][:ncases:ncases]
 
-	// Replace send/receive cases involving nil channels with
-	// caseNil so logic below can assume non-nil channel.
+	// 将那些空的chan给一个默认值
 	for i := range scases {
 		cas := &scases[i]
+		// nil的chan
 		if cas.c == nil && cas.kind != caseDefault {
 			*cas = scase{}
 		}
@@ -571,15 +575,8 @@ func selectgo(cas0 *scase, order0 *uint16, ncases int) (int, bool) {
 		}
 	}
 
-	// The compiler rewrites selects that statically have
-	// only 0 or 1 cases plus default into simpler constructs.
-	// The only way we can end up with such small sel.ncase
-	// values here is for a larger select in which most channels
-	// have been nilled out. The general code handles those
-	// cases correctly, and they are rare enough not to bother
-	// optimizing (and needing to test).
 
-	// generate permuted order
+	// 调换顺序，select随机的原因
 	for i := 1; i < ncases; i++ {
 		j := fastrandn(uint32(i + 1))
 		pollorder[i] = pollorder[j]
@@ -621,17 +618,8 @@ func selectgo(cas0 *scase, order0 *uint16, ncases int) (int, bool) {
 		}
 		lockorder[j] = o
 	}
-
-	if debugSelect {
-		for i := 0; i+1 < ncases; i++ {
-			if scases[lockorder[i]].c.sortkey() > scases[lockorder[i+1]].c.sortkey() {
-				print("i=", i, " x=", lockorder[i], " y=", lockorder[i+1], "\n")
-				throw("select: broken sort")
-			}
-		}
-	}
-
-	// lock all the channels involved in the select
+	
+	// 锁定所有chan
 	sellock(scases, lockorder)
 
 	var (
@@ -653,47 +641,61 @@ loop:
 	var cas *scase
 	var recvOK bool
 	for i := 0; i < ncases; i++ {
+		// 根据pollorder来保证乱序的
 		casi = int(pollorder[i])
 		cas = &scases[casi]
 		c = cas.c
 
 		switch cas.kind {
+		// 空的chan，什么都不做
 		case caseNil:
 			continue
-
+		
+		// 从chan读
 		case caseRecv:
 			sg = c.sendq.dequeue()
 			if sg != nil {
+				// 发送者队列不是空的，跳到接收
 				goto recv
 			}
 			if c.qcount > 0 {
+				// 发送者队列时空的，但是有数据
 				goto bufrecv
 			}
 			if c.closed != 0 {
+				// channel被关闭了，可以获取默认值
 				goto rclose
 			}
 
+		// 向chan发
 		case caseSend:
 			if raceenabled {
 				racereadpc(c.raceaddr(), cas.pc, chansendpc)
 			}
 			if c.closed != 0 {
+				// 向一个关闭的chan发送数据
 				goto sclose
 			}
 			sg = c.recvq.dequeue()
 			if sg != nil {
+				// 有接收者等着，跳到发送
 				goto send
 			}
 			if c.qcount < c.dataqsiz {
+				// 缓冲区足够，可以发送
 				goto bufsend
 			}
-
+		
+		// 不会立刻结束循环，而只是做个记录
+		// 还是要从其他的case中寻找
 		case caseDefault:
+			// select default
 			dfli = casi
 			dfl = cas
 		}
 	}
 
+	// 没有case可以响应，走default
 	if dfl != nil {
 		selunlock(scases, lockorder)
 		casi = dfli
@@ -703,19 +705,28 @@ loop:
 
 	// pass 2 - enqueue on all chans
 	gp = getg()
+	// 异常，有sudog在等待这个g？
 	if gp.waiting != nil {
 		throw("gp.waiting != nil")
 	}
+	// 这个就很牛逼了
 	nextp = &gp.waiting
+	// 此时没有case可以通过，并且没有default
+	// 需要把当前的这个g挂在所有的chan下面
 	for _, casei := range lockorder {
 		casi = int(casei)
 		cas = &scases[casi]
+		// 空的chan就不需要挂了
+		// select 空的chan，这个case就永远不会成功了
 		if cas.kind == caseNil {
 			continue
 		}
+		// 拿到这个case对应的chan
 		c = cas.c
+		// 打包成sudog
 		sg := acquireSudog()
 		sg.g = gp
+		// 当前这个sudog标记为因为select而阻塞，这个很重要
 		sg.isSelect = true
 		// No stack splits between assigning elem and enqueuing
 		// sg on gp.waiting where copystack can find it.
@@ -726,9 +737,15 @@ loop:
 		}
 		sg.c = c
 		// Construct waiting list in lock order.
+		// 这个地方串成一个列表。
+		// 把上一个sudog的nextp指向当前这这个sudog
 		*nextp = sg
+		// 当前这个wailink就会在下一次循环指向下一个sudog
+		// 这样唤醒g的时候就可以拿到gp.waiting
+		// 而gp.waiting就是因select导致打包的sudog的链表的头节点
 		nextp = &sg.waitlink
 
+		// 根据case的类型依次挂在到对应chan上
 		switch cas.kind {
 		case caseRecv:
 			c.recvq.enqueue(sg)
@@ -739,14 +756,20 @@ loop:
 	}
 
 	// wait for someone to wake us up
+	// 阻塞当前这个gr，等待唤醒
 	gp.param = nil
 	gopark(selparkcommit, nil, waitReasonSelect, traceEvGoBlockSelect, 1)
+	
+	// 被唤醒了
 	gp.activeStackChans = false
 
 	sellock(scases, lockorder)
 
 	gp.selectDone = 0
+	// 唤醒这个gr的sudog，可能为nil
 	sg = (*sudog)(gp.param)
+	// 这里没有判断param是否是空，也就是没有判断是否是异常唤醒
+	// 之前chan部分有看到，关闭chan导致唤醒这个地方就是nil了
 	gp.param = nil
 
 	// pass 3 - dequeue from unsuccessful chans
@@ -757,6 +780,8 @@ loop:
 	cas = nil
 	sglist = gp.waiting
 	// Clear all elem before unlinking from gp.waiting.
+	// 根据gp.waiting得到的sudog链表。依次设置状态为false。
+	// 唤醒了就可以把之前打包在各个chan的sudog拿走了
 	for sg1 := gp.waiting; sg1 != nil; sg1 = sg1.waitlink {
 		sg1.isSelect = false
 		sg1.elem = nil
@@ -764,6 +789,7 @@ loop:
 	}
 	gp.waiting = nil
 
+	// 对于每个case，把各个chan的sudog删除掉
 	for _, casei := range lockorder {
 		k = &scases[casei]
 		if k.kind == caseNil {
@@ -772,11 +798,14 @@ loop:
 		if sglist.releasetime > 0 {
 			k.releasetime = sglist.releasetime
 		}
+		// 找到唤醒他的sudog
+		// 因为sg可能是nil。所以这个地方可能不会走到
 		if sg == sglist {
 			// sg has already been dequeued by the G that woke us up.
 			casi = int(casei)
 			cas = k
 		} else {
+			// 如果不是唤醒他的sudog，从对应的chan队列sudog拿走
 			c = k.c
 			if k.kind == caseSend {
 				c.sendq.dequeueSudoG(sglist)
@@ -784,12 +813,17 @@ loop:
 				c.recvq.dequeueSudoG(sglist)
 			}
 		}
+		// 依次获取sudog
 		sgnext = sglist.waitlink
 		sglist.waitlink = nil
+		// 释放这个sudog
 		releaseSudog(sglist)
 		sglist = sgnext
 	}
-
+	
+	// cas为nil，说明param是nil，说明因为closechan导致的gr被唤醒
+	// goto loop 就可以发现对应被关闭的chan了
+	// 这里因为要走上面那一堆逻辑（把chan上的sudog拿走），所以不能直接判断param=nil就goto loop
 	if cas == nil {
 		// We can wake up with gp.param == nil (so cas == nil)
 		// when a channel involved in the select has been closed.
@@ -803,34 +837,19 @@ loop:
 		goto loop
 	}
 
+	// 找到对应唤醒他的sudog了
 	c = cas.c
 
-	if debugSelect {
-		print("wait-return: cas0=", cas0, " c=", c, " cas=", cas, " kind=", cas.kind, "\n")
-	}
-
+	// 如果这个case是从chan接收，第二个参数变成true
 	if cas.kind == caseRecv {
 		recvOK = true
 	}
 
-	if raceenabled {
-		if cas.kind == caseRecv && cas.elem != nil {
-			raceWriteObjectPC(c.elemtype, cas.elem, cas.pc, chanrecvpc)
-		} else if cas.kind == caseSend {
-			raceReadObjectPC(c.elemtype, cas.elem, cas.pc, chansendpc)
-		}
-	}
-	if msanenabled {
-		if cas.kind == caseRecv && cas.elem != nil {
-			msanwrite(cas.elem, c.elemtype.size)
-		} else if cas.kind == caseSend {
-			msanread(cas.elem, c.elemtype.size)
-		}
-	}
-
+	// 解锁
 	selunlock(scases, lockorder)
 	goto retc
 
+// 从buffer获取
 bufrecv:
 	// can receive from buffer
 	if raceenabled {
@@ -857,6 +876,7 @@ bufrecv:
 	selunlock(scases, lockorder)
 	goto retc
 
+// 向buffer发送
 bufsend:
 	// can send to buffer
 	if raceenabled {
@@ -876,6 +896,7 @@ bufsend:
 	selunlock(scases, lockorder)
 	goto retc
 
+// 直接接收，需要唤醒某个发送者
 recv:
 	// can receive from sleeping sender (sg)
 	recv(c, sg, cas.elem, func() { selunlock(scases, lockorder) }, 2)
@@ -885,6 +906,7 @@ recv:
 	recvOK = true
 	goto retc
 
+// 从已经关闭的chan读取数据
 rclose:
 	// read at end of closed channel
 	selunlock(scases, lockorder)
@@ -897,6 +919,7 @@ rclose:
 	}
 	goto retc
 
+// 直接发送，需要唤醒某个接收者
 send:
 	// can send to a sleeping receiver (sg)
 	if raceenabled {
@@ -911,12 +934,14 @@ send:
 	}
 	goto retc
 
+// 返回数据
 retc:
 	if cas.releasetime > 0 {
 		blockevent(cas.releasetime-t0, 1)
 	}
 	return casi, recvOK
 
+// 向关闭的chan发送数据
 sclose:
 	// send on closed channel
 	selunlock(scases, lockorder)
