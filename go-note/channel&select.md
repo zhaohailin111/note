@@ -175,6 +175,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	mysg.isSelect = false
 	mysg.c = c
 	gp.waiting = mysg
+	// 这个param是会在被唤醒的时候设置为这个g对应打包的sudug
 	gp.param = nil
 	c.sendq.enqueue(mysg)
 	
@@ -193,8 +194,8 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	}
 	gp.waiting = nil
 	gp.activeStackChans = false
-	// 这个param是唤醒时传递的chan
-	// 如果是正常接收者去唤醒一个发送者，这里会带上接收者的sudog
+	// 出了close，被唤醒的时候这个param应该是打包这个g的sudog
+	// 如果是正常接收者去唤醒一个发送者，那这个param是对应的发送者，select会用到
 	if gp.param == nil {
 		// 再次检查
 		// 异常唤醒
@@ -303,6 +304,7 @@ func closechan(c *hchan) {
 			sg.releasetime = cputicks()
 		}
 		gp := sg.g
+		// 关闭chan的时候把他设置为nil，唤醒的时候进行检查
 		gp.param = nil
 		if raceenabled {
 			raceacquireg(gp, c.raceaddr())
@@ -321,6 +323,8 @@ func closechan(c *hchan) {
 			sg.releasetime = cputicks()
 		}
 		gp := sg.g
+		// 因为发生panic的gr不是close这个chan的gr
+		// 所以在这里是不会panic的，而是发送者被唤醒的时候panic
 		gp.param = nil
 		if raceenabled {
 			raceacquireg(gp, c.raceaddr())
@@ -766,7 +770,9 @@ loop:
 	sellock(scases, lockorder)
 
 	gp.selectDone = 0
-	// 唤醒这个gr的sudog，可能为nil
+	// 之前说gr唤醒时，这个param就是打包当前这个gr的sudog，也就是sg打包当前这个gr
+	// 但是因为select其实是将当前的gr打包了很多sudog放在各个case的chan上面
+	// 而之前说了gp.waiting刚好把刚才打包的很多个sudog串起来了
 	sg = (*sudog)(gp.param)
 	// 这里没有判断param是否是空，也就是没有判断是否是异常唤醒
 	// 之前chan部分有看到，关闭chan导致唤醒这个地方就是nil了
@@ -778,6 +784,12 @@ loop:
 	// We singly-linked up the SudoGs in lock order.
 	casi = -1
 	cas = nil
+	
+	// 这个地方就是刚才串起来的
+	// 而上面的那个sg就是对应的唤醒的sudog
+	// 也就是说，唤醒的时候，只知道是唤醒了哪个gr，但是并不知道是哪个sudog
+	// 通过sglist和sg就可以找到到底是哪个case唤醒的了。简直太牛逼了
+	// 太牛逼了，太牛逼了，太牛逼了！！！
 	sglist = gp.waiting
 	// Clear all elem before unlinking from gp.waiting.
 	// 根据gp.waiting得到的sudog链表。依次设置状态为false。
