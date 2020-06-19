@@ -960,3 +960,116 @@ sclose:
 	panic(plainError("send on closed channel"))
 }
 ```
+
+```go
+// 最后看下双向链表
+// chan的接收者和发送者都是双向链表
+// 都是队列，但是用的双向链表。
+
+// 追加，没什么说的
+func (q *waitq) enqueue(sgp *sudog) {
+	// 当前这个sudog是最后一个
+	sgp.next = nil
+	// 链表的尾节点
+	x := q.last
+	// 空链表，拿这个sudog初始化一下
+	if x == nil {
+		sgp.prev = nil
+		q.first = sgp
+		q.last = sgp
+		return
+	}
+	// 不是空的，
+	sgp.prev = x
+	x.next = sgp
+	q.last = sgp
+}
+
+// 取头节点
+func (q *waitq) dequeue() *sudog {
+	for {
+		// 头节点为空
+		sgp := q.first
+		if sgp == nil {
+			return nil
+		}
+		
+		// 拿到头节点的next
+		y := sgp.next
+		
+		// 如果为nil，初始化链表
+		if y == nil {
+			q.first = nil
+			q.last = nil
+		} else {
+			// 否则，往回移动一位
+			y.prev = nil
+			q.first = y
+			// 删除节点的时候会根据这个判断
+			// 如果不为空说明是中间节点或者头节点
+			// 如果为空说明已经删除或者是尾节点
+			// 所以这个是有必要的
+			sgp.next = nil // mark as removed (see dequeueSudog)
+		}
+
+		// 拿到的这个sudog如果是正在select，并且对应的g还没有唤醒，也就是selectdone是1。
+		// select结束的时候，会把selectdone变成0
+		// 会有一个很小的窗口出现，select其实已经结束了，但是这个sudog还没有加上锁
+		// 在selectdone以后，需要依次给每个case的chan加锁。
+		// 这个时候执行select的gr已经唤醒了，就要跳过
+		// 如有2个chan被select，第一个chan唤醒了select的gr。
+		// 这时候select的gr需要给这两个chan加锁，但是正要加锁的时候第二个chan也可读写了，这样也会唤醒这个gr出现异常。所以这里需要过滤一下
+		if sgp.isSelect && !atomic.Cas(&sgp.g.selectDone, 0, 1) {
+			continue
+		}
+
+		return sgp
+	}
+}
+
+
+// 删除某个节点
+// 可能是删除中间的，所以chan的队列都是双向链表
+func (q *waitq) dequeueSudoG(sgp *sudog) {
+	x := sgp.prev
+	y := sgp.next
+	
+	// 三种情况，
+	// 头节点，中间节点，尾节点
+	if x != nil {
+		if y != nil {
+			// middle of queue
+			x.next = y
+			y.prev = x
+			sgp.next = nil
+			sgp.prev = nil
+			return
+		}
+		// end of queue
+		x.next = nil
+		q.last = x
+		sgp.prev = nil
+		return
+	}
+	if y != nil {
+		// start of queue
+		y.prev = nil
+		q.first = y
+		sgp.next = nil
+		return
+	}
+
+	// x==y==nil. Either sgp is the only element in the queue,
+	// or it has already been removed. Use q.first to disambiguate.
+	// x==y==nil 队列中只有一个元素，清空队列
+	if q.first == sgp {
+		q.first = nil
+		q.last = nil
+	}
+	
+	// 还有一种情况，这个chan唤醒了select。
+	// 这时候这个sudog其实已经被移除了，所以什么都不用做了
+}
+
+
+```
