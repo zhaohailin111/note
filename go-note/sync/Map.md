@@ -230,28 +230,50 @@ func (e *entry) tryExpungeLocked() (isExpunged bool) {
 }
 
 
-// map中删除
-func (m *Map) Delete(key interface{}) {
+// 加载并删除
+func (m *Map) LoadAndDelete(key interface{}) (value interface{}, loaded bool) {
+	// 先从read中读取
 	read, _ := m.read.Load().(readOnly)
 	e, ok := read.m[key]
-	
-	// 如果不在read且dirty中有read没有的，从dirty删除
 	if !ok && read.amended {
+		// read中不存在，从dirty读取
 		m.mu.Lock()
 		read, _ = m.read.Load().(readOnly)
 		e, ok = read.m[key]
 		if !ok && read.amended {
-			delete(m.dirty, key)
+			// 从dirty中删除，这里只是把e改成了dirty中的指针，并没有真正从dirty中删除
+			// 而在e.delete()中进行删除
+			// 但是在e.delete中删除并不是将key删除掉，这样key还是在map中的
+			// 这个改动是1.15中加的，存在一些bug
+			// dirty中的key在某些场景下是不会被删除掉的。
+			// 在极端情况下存在内存泄漏的问题
+			
+			// 删除的时候并没有真正删除对应的key
+			// 如果dirty无法提升为read，那么dirty中的key就永远不会减少
+			// 如果读的量小于dirty中新增key的量就会导致泄漏。
+			// 而在1.14版本删除是直接删除key的，所以导致了行为不一致
+			// https://github.com/golang/go/issues/40999
+			e, ok = m.dirty[key]
+			// Regardless of whether the entry was present, record a miss: this key
+			// will take the slow path until the dirty map is promoted to the read
+			// map.
+			m.missLocked()
 		}
 		m.mu.Unlock()
 	}
 	if ok {
-		// 如果在read中，则标记状态为nil
-		e.delete()
+		return e.delete()
 	}
+	return nil, false
+}
+
+// map中删除
+func (m *Map) Delete(key interface{}) {
+	m.LoadAndDelete(key)
 }
 
 // 删除某个节点，将节点改为nil
+// 但是没有删除key
 func (e *entry) delete() (hadValue bool) {
 	for {
 		p := atomic.LoadPointer(&e.p)
