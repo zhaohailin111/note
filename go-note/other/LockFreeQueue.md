@@ -1,5 +1,5 @@
 # LockFreeQueue
-基于https://github.com/smallnest/queue/blob/master/lockfree_queue.go实现的lockFreeQueue分析
+基于https://github.com/smallnest/queue/blob/master/lockfree_queue.go 实现分析
 
 ```go
 // Package queue provides a lock-free queue and two-Lock concurrent queue which use the algorithm proposed by Michael and Scott.
